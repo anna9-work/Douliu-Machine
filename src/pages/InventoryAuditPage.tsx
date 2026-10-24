@@ -84,6 +84,11 @@ type ReviewRow = AuditItem & {
   diff_piece: number
 }
 
+type MissingCostRow = {
+  product_sku: string
+  product_name: string
+}
+
 export default function InventoryAuditPage({ onBack }: Props) {
   const [screen, setScreen] = useState<Screen>("menu")
   const [warehouses, setWarehouses] = useState<Warehouse[]>([])
@@ -102,6 +107,7 @@ export default function InventoryAuditPage({ onBack }: Props) {
   const [searchKeyword, setSearchKeyword] = useState("")
   const [searchResults, setSearchResults] = useState<Product[]>([])
   const [selectedProduct, setSelectedProduct] = useState<Product | null>(null)
+  const [missingCostRows, setMissingCostRows] = useState<MissingCostRow[]>([])
   const [countBox, setCountBox] = useState("0")
   const [countPiece, setCountPiece] = useState("0")
   const [loading, setLoading] = useState(false)
@@ -342,6 +348,7 @@ export default function InventoryAuditPage({ onBack }: Props) {
     setBizDate(nextAudit.biz_date)
     setWarehouse(nextAudit.warehouse_code)
     setSelectedProduct(null)
+    setMissingCostRows([])
     setSearchKeyword("")
     setSearchResults([])
     setMessage("")
@@ -759,6 +766,14 @@ export default function InventoryAuditPage({ onBack }: Props) {
       setSaving(true)
       setError("")
       setMessage("")
+      setMissingCostRows([])
+
+      const nextMissingCostRows = await findMissingCostRows()
+      if (nextMissingCostRows.length > 0) {
+        setMissingCostRows(nextMissingCostRows)
+        setError(formatMissingCostMessage(nextMissingCostRows))
+        return
+      }
 
       const { error: approveError } = await supabase.rpc(
         "rpc_inventory_audit_approve",
@@ -774,10 +789,92 @@ export default function InventoryAuditPage({ onBack }: Props) {
       await loadAudits("submitted")
     } catch (err) {
       console.error(err)
-      setError(getErrorMessage(err, "審核執行失敗"))
+      const message = getRawErrorMessage(err, "審核執行失敗")
+      const parsedSku = parseMissingCostSku(message)
+      if (parsedSku) {
+        const knownRow =
+          reviewRows.find((row) => row.product_sku === parsedSku) ??
+          missingStockRows.find((row) => row.product_sku === parsedSku)
+        setMissingCostRows([
+          {
+            product_sku: parsedSku,
+            product_name: knownRow?.product_name ?? parsedSku,
+          },
+        ])
+        setError(formatMissingCostMessage([{ product_sku: parsedSku }]))
+      } else {
+        setError(message)
+      }
     } finally {
       setSaving(false)
     }
+  }
+
+  async function findMissingCostRows() {
+    const candidates = new Map<string, MissingCostRow>()
+
+    for (const row of reviewRows) {
+      if (row.diff_box === 0 && row.diff_piece === 0) continue
+      candidates.set(row.product_sku, {
+        product_sku: row.product_sku,
+        product_name: row.product_name,
+      })
+    }
+
+    for (const row of missingStockRows) {
+      candidates.set(row.product_sku, {
+        product_sku: row.product_sku,
+        product_name: row.product_name,
+      })
+    }
+
+    if (candidates.size === 0) return []
+
+    const skus = [...candidates.keys()]
+    const hasCost = new Set<string>()
+    const batchSize = 50
+    const pageSize = 500
+
+    // Read every page so a long ledger cannot hide another item's unit cost.
+    for (let batchStart = 0; batchStart < skus.length; batchStart += batchSize) {
+      const batch = skus.slice(batchStart, batchStart + batchSize)
+      let offset = 0
+
+      while (true) {
+        const { data, error: costError } = await supabase
+          .from("inventory_ledger")
+          .select("product_sku,unit_cost_piece,source,voided_by_id")
+          .eq("group_code", GROUP_CODE)
+          .in("product_sku", batch)
+          .gt("unit_cost_piece", 0)
+          .is("voided_by_id", null)
+          .order("id", { ascending: true })
+          .range(offset, offset + pageSize - 1)
+
+        if (costError) throw costError
+
+        const costRows = (data ?? []) as Array<{
+          product_sku: string
+          unit_cost_piece: number | null
+          source: string | null
+          voided_by_id: number | null
+        }>
+
+        if (costRows.length === 0) break
+
+        for (const row of costRows) {
+          if (String(row.source ?? "").toLowerCase() === "tx_void") continue
+          hasCost.add(row.product_sku.toLowerCase())
+        }
+
+        if (batch.every((sku) => hasCost.has(sku))) break
+        offset += costRows.length
+      }
+    }
+
+    return [...candidates.values()].filter(
+      (row) => !hasCost.has(row.product_sku)
+    )
   }
 
   async function copyReviewCsv() {
@@ -850,6 +947,7 @@ export default function InventoryAuditPage({ onBack }: Props) {
     setStockMap(new Map())
     setReviewExecutable(false)
     setSelectedProduct(null)
+    setMissingCostRows([])
     setMessage("")
     setError("")
   }
@@ -861,6 +959,7 @@ export default function InventoryAuditPage({ onBack }: Props) {
     setStockMap(new Map())
     setReviewExecutable(false)
     setAuditListManaging(false)
+    setMissingCostRows([])
     void loadAudits("all")
   }
 
@@ -871,6 +970,7 @@ export default function InventoryAuditPage({ onBack }: Props) {
     setStockMap(new Map())
     setReviewExecutable(false)
     setAuditListManaging(false)
+    setMissingCostRows([])
     void loadAudits("submitted")
   }
 
@@ -934,6 +1034,19 @@ export default function InventoryAuditPage({ onBack }: Props) {
 
       {message && <div style={messageStyle}>{message}</div>}
       {error && <div style={errorStyle}>{error}</div>}
+      {missingCostRows.length > 0 && (
+        <section style={missingCostPanelStyle}>
+          <div style={missingCostHeaderStyle}>需要補入庫單價</div>
+          <div style={missingCostListStyle}>
+            {missingCostRows.map((row) => (
+              <div key={row.product_sku} style={missingCostRowStyle}>
+                <span>{row.product_name}</span>
+                <strong>#{row.product_sku} 請補入單價</strong>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
 
       {screen === "menu" && (
         <section style={menuPanelStyle}>
@@ -1766,12 +1879,27 @@ function formatDateTime(value: string) {
 }
 
 function getErrorMessage(err: unknown, fallback: string) {
+  const message = getRawErrorMessage(err, fallback)
+  const sku = parseMissingCostSku(message)
+  return sku ? formatMissingCostMessage([{ product_sku: sku }]) : message
+}
+
+function getRawErrorMessage(err: unknown, fallback: string) {
   if (err instanceof Error) return err.message
   if (typeof err === "object" && err !== null && "message" in err) {
     const message = (err as { message?: unknown }).message
     if (typeof message === "string") return message
   }
   return fallback
+}
+
+function parseMissingCostSku(message: string) {
+  const match = message.match(/INVENTORY_AUDIT_MISSING_COST:[\s\S]*?sku=([^\s]+)/i)
+  return match?.[1]?.trim().toLowerCase() ?? null
+}
+
+function formatMissingCostMessage(rows: Pick<MissingCostRow, "product_sku">[]) {
+  return `${rows.map((row) => `#${row.product_sku}`).join("、")} 請補入單價，補完後再執行盤點。`
 }
 
 const pageStyle: CSSProperties = {
@@ -1975,6 +2103,42 @@ const errorStyle: CSSProperties = {
   fontSize: 14,
   fontWeight: 850,
   marginBottom: 12,
+}
+
+const missingCostPanelStyle: CSSProperties = {
+  border: "1px solid rgba(251,191,36,0.34)",
+  borderRadius: 16,
+  background: "rgba(113,63,18,0.24)",
+  padding: 12,
+  marginBottom: 12,
+}
+
+const missingCostHeaderStyle: CSSProperties = {
+  color: "#fde68a",
+  fontSize: 14,
+  fontWeight: 950,
+  marginBottom: 8,
+}
+
+const missingCostListStyle: CSSProperties = {
+  display: "grid",
+  gap: 8,
+}
+
+const missingCostRowStyle: CSSProperties = {
+  display: "flex",
+  flexWrap: "wrap",
+  justifyContent: "space-between",
+  overflowWrap: "anywhere",
+  alignItems: "center",
+  gap: 10,
+  border: "1px solid rgba(251,191,36,0.18)",
+  borderRadius: 12,
+  background: "rgba(2,6,23,0.28)",
+  color: "#f8fafc",
+  padding: "9px 10px",
+  fontSize: 13,
+  fontWeight: 850,
 }
 
 const listPanelStyle: CSSProperties = {
