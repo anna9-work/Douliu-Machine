@@ -168,22 +168,6 @@ export default function InventoryAuditPage({ onBack }: Props) {
     })
   }, [items, stockMap])
 
-  const reviewSummary = useMemo(() => {
-    return reviewRows.reduce(
-      (acc, row) => {
-        if (row.diff_box !== 0 || row.diff_piece !== 0) acc.diffItems += 1
-        acc.diffBox += row.diff_box
-        acc.diffPiece += row.diff_piece
-        return acc
-      },
-      {
-        diffItems: 0,
-        diffBox: 0,
-        diffPiece: 0,
-      }
-    )
-  }, [reviewRows])
-
   useEffect(() => {
     void loadWarehouses()
     void loadWarehouseManageRows()
@@ -292,12 +276,47 @@ export default function InventoryAuditPage({ onBack }: Props) {
 
       if (listError) throw listError
 
-      setAudits(
-        ((data ?? []) as AuditRow[]).map((row) => ({
-          ...normalizeAudit(row),
-          item_count: Number(row.item_count ?? 0),
-        }))
-      )
+      const rows = (data ?? []) as AuditRow[]
+
+      if (kind === "all") {
+        // Drafts remain available even when their business date is over 90 days old.
+        const { data: drafts, error: draftError } = await supabase.rpc(
+          "rpc_inventory_audits_list",
+          {
+            p_group_code: GROUP_CODE,
+            p_biz_date_from: null,
+            p_biz_date_to: null,
+            p_status: "draft",
+          }
+        )
+
+        if (draftError) throw draftError
+
+        const byId = new Map<number, AuditRow>()
+        for (const row of [...rows, ...((drafts ?? []) as AuditRow[])]) {
+          byId.set(Number(row.id), row)
+        }
+
+        setAudits(
+          [...byId.values()]
+            .map((row) => ({
+              ...normalizeAudit(row),
+              item_count: Number(row.item_count ?? 0),
+            }))
+            .sort(
+              (a, b) =>
+                new Date(b.created_at).getTime() - new Date(a.created_at).getTime() ||
+                b.id - a.id
+            )
+        )
+      } else {
+        setAudits(
+          rows.map((row) => ({
+            ...normalizeAudit(row),
+            item_count: Number(row.item_count ?? 0),
+          }))
+        )
+      }
     } catch (err) {
       console.error(err)
       setError(getErrorMessage(err, "讀取盤點單失敗"))
@@ -343,13 +362,20 @@ export default function InventoryAuditPage({ onBack }: Props) {
   }
 
   async function openAudit(row: AuditRow, forceReview = false) {
+    if (saving || loading) return
+
     const nextAudit = normalizeAudit(row)
     setAudit(nextAudit)
     setBizDate(nextAudit.biz_date)
     setWarehouse(nextAudit.warehouse_code)
+    setItems([])
+    setStockMap(new Map())
     setSelectedProduct(null)
     setMissingCostRows([])
+    setSearchOpen(false)
     setSearchKeyword("")
+    setCountBox("0")
+    setCountPiece("0")
     setSearchResults([])
     setMessage("")
     setError("")
@@ -358,7 +384,7 @@ export default function InventoryAuditPage({ onBack }: Props) {
         nextAudit.status === "submitted" &&
         !isAuditReviewExpired(nextAudit)
     )
-    setScreen(forceReview || nextAudit.status !== "draft" ? "review" : "entry")
+    setScreen(nextAudit.status === "draft" ? "entry" : "review")
     await loadAuditItems(nextAudit)
   }
 
@@ -578,6 +604,13 @@ export default function InventoryAuditPage({ onBack }: Props) {
       return
     }
 
+    if (audit.status !== "draft") {
+      setError("盤點單已送審，不能再加入商品")
+      return
+    }
+
+    if (saving || loading) return
+
     if (!selectedProduct) {
       setError("請先選擇商品")
       return
@@ -659,7 +692,11 @@ export default function InventoryAuditPage({ onBack }: Props) {
   }
 
   async function updateItem(item: AuditItem, box: number, piece: number) {
-    if (!audit) return
+    if (!audit || saving || loading) return
+    if (audit.status !== "draft") {
+      setError("盤點單已送審，不能再修改商品")
+      return
+    }
 
     if (!Number.isFinite(box) || box < 0 || !Number.isFinite(piece) || piece < 0) {
       setError("盤點數量不可小於 0")
@@ -691,7 +728,11 @@ export default function InventoryAuditPage({ onBack }: Props) {
   }
 
   async function deleteItem(item: AuditItem) {
-    if (!audit) return
+    if (!audit || saving || loading) return
+    if (audit.status !== "draft") {
+      setError("盤點單已送審，不能再刪除商品")
+      return
+    }
 
     try {
       setSaving(true)
@@ -716,7 +757,11 @@ export default function InventoryAuditPage({ onBack }: Props) {
   }
 
   async function submitAudit() {
-    if (!audit) return
+    if (!audit || saving || loading) return
+    if (audit.status !== "draft") {
+      setError("此盤點單已送出審核")
+      return
+    }
 
     if (items.length === 0) {
       setError("盤點單至少需要 1 個品項")
@@ -948,6 +993,9 @@ export default function InventoryAuditPage({ onBack }: Props) {
     setReviewExecutable(false)
     setSelectedProduct(null)
     setMissingCostRows([])
+    setSearchOpen(false)
+    setSearchKeyword("")
+    setSearchResults([])
     setMessage("")
     setError("")
   }
@@ -1008,6 +1056,7 @@ export default function InventoryAuditPage({ onBack }: Props) {
         ) : screen === "entry" && editable ? (
           <button
             onClick={() => setSearchOpen(true)}
+            disabled={loading || saving}
             style={ghostButtonStyle}
           >
             +商品
@@ -1109,7 +1158,7 @@ export default function InventoryAuditPage({ onBack }: Props) {
             piece={itemSummary.piece}
           />
 
-          {selectedProduct && editable && (
+          {selectedProduct && editable && !loading && (
             <section style={panelStyle}>
               <div style={selectedProductStyle}>
                 <div>
@@ -1179,7 +1228,9 @@ export default function InventoryAuditPage({ onBack }: Props) {
             </div>
 
             {items.length === 0 && (
-              <p style={emptyStyle}>點右上角「+商品」開始輸入盤點數據</p>
+              <p style={emptyStyle}>
+                {loading ? "讀取中..." : "點右上角「+商品」開始輸入盤點數據"}
+              </p>
             )}
 
             {items.map((item) => (
@@ -1187,7 +1238,7 @@ export default function InventoryAuditPage({ onBack }: Props) {
                 key={item.id}
                 item={item}
                 editable={editable}
-                saving={saving}
+                saving={saving || loading}
                 onUpdate={updateItem}
                 onDelete={deleteItem}
               />
@@ -1197,10 +1248,10 @@ export default function InventoryAuditPage({ onBack }: Props) {
           {editable && (
             <button
               onClick={() => void submitAudit()}
-              disabled={saving || items.length === 0}
+              disabled={saving || loading || items.length === 0}
               style={{
                 ...bottomButtonStyle,
-                opacity: saving || items.length === 0 ? 0.65 : 1,
+                opacity: saving || loading || items.length === 0 ? 0.65 : 1,
               }}
             >
               送出審核
@@ -1219,28 +1270,6 @@ export default function InventoryAuditPage({ onBack }: Props) {
             piece={itemSummary.piece}
           />
 
-          <section style={reviewSummaryStyle}>
-            <div>
-              <span>差異品項</span>
-              <strong>{formatNumber(reviewSummary.diffItems)}</strong>
-            </div>
-            <div>
-              <span>差異箱數</span>
-              <strong>{formatSigned(reviewSummary.diffBox)}</strong>
-            </div>
-            <div>
-              <span>差異散數</span>
-              <strong>{formatSigned(reviewSummary.diffPiece)}</strong>
-            </div>
-          </section>
-
-          {missingStockRows.length > 0 && audit.status === "submitted" && (
-            <div style={warningStyle}>
-              未輸入但系統仍有庫存：{missingStockRows.length} 項。執行後會視為
-              0 並調整庫存。
-            </div>
-          )}
-
           {audit.status === "submitted" && !reviewExecutable && (
             <div style={isAuditReviewExpired(audit) ? warningStyle : messageStyle}>
               {isAuditReviewExpired(audit)
@@ -1252,22 +1281,12 @@ export default function InventoryAuditPage({ onBack }: Props) {
           <section style={listPanelStyle}>
             <div style={sectionTitleRowStyle}>
               <h2 style={sectionTitleStyle}>盤點審核數據</h2>
-              <span style={mutedStyle}>系統 / 盤點 / 差異</span>
+              <span style={mutedStyle}>盤點數據 / 箱入數</span>
             </div>
 
             {reviewRows.map((row) => (
               <ReviewCard key={row.id} row={row} />
             ))}
-
-            {missingStockRows.slice(0, 20).map((row) => (
-              <MissingStockCard key={row.product_sku} row={row} />
-            ))}
-
-            {missingStockRows.length > 20 && (
-              <p style={emptyStyle}>
-                另有 {missingStockRows.length - 20} 項未輸入庫存，CSV 會完整複製。
-              </p>
-            )}
           </section>
 
           {audit.status === "submitted" && reviewExecutable && (
@@ -1357,7 +1376,7 @@ export default function InventoryAuditPage({ onBack }: Props) {
             </div>
 
             <p style={emptyStyle}>
-              點擊後即可「啟用/停用」，需新增其他類別請洽管理員
+              這裡只控制新單是否可選，歷史交易與舊盤點資料不會被刪除。
             </p>
 
             {message && <div style={messageStyle}>{message}</div>}
@@ -1513,6 +1532,8 @@ function AuditList({
           <article key={row.id} style={auditRowStyle}>
             <button
               onClick={() => onOpen(row)}
+              disabled={loading || saving}
+              aria-label={`${row.biz_date} ${getWarehouseName(row.warehouse_code, warehouses)} ${row.status === "draft" ? "繼續盤點" : "查看明細"}`}
               style={{
                 ...auditOpenButtonStyle,
                 paddingRight: managing ? 68 : 14,
@@ -1528,6 +1549,9 @@ function AuditList({
               <span style={auditPillsStyle}>
                 {expired && <span style={expiredPillStyle}>已逾期</span>}
                 <span style={countPillStyle}>{row.item_count} 項</span>
+                <span style={mutedStyle}>
+                  {row.status === "draft" ? "繼續盤點" : "查看明細"}
+                </span>
               </span>
             </button>
 
@@ -1667,76 +1691,26 @@ function AuditItemCard({
 }
 
 function ReviewCard({ row }: { row: ReviewRow }) {
-  const isSame = row.diff_box === 0 && row.diff_piece === 0
-
   return (
     <div style={reviewCardStyle}>
       <div style={reviewTopStyle}>
-        <div>
-          <strong style={skuStyle}>{row.product_sku}</strong>
-          <div style={nameStyle}>{row.product_name}</div>
+        <div style={reviewNameBlockStyle}>
+          <div style={reviewNameStyle}>{row.product_name}</div>
         </div>
-        <span
-          style={{
-            ...diffPillStyle,
-            color: isSame ? "#86efac" : "#fbbf24",
-          }}
-        >
-          {isSame ? "一致" : "有差異"}
-        </span>
-      </div>
-
-      <div style={compareGridStyle}>
-        <div>
-          <span>系統</span>
-          <strong>
-            箱 {formatNumber(row.system_box)} / 散 {formatNumber(row.system_piece)}
-          </strong>
-        </div>
-        <div>
-          <span>盤點</span>
-          <strong>
-            箱 {formatNumber(row.count_box)} / 散 {formatNumber(row.count_piece)}
-          </strong>
-        </div>
-        <div>
-          <span>差異</span>
-          <strong>
-            箱 {formatSigned(row.diff_box)} / 散 {formatSigned(row.diff_piece)}
-          </strong>
+        <div style={reviewSkuBlockStyle}>
+          <strong style={reviewSkuStyle}>{row.product_sku}</strong>
+          <small style={reviewUnitStyle}>箱入數：{row.units_per_box}</small>
         </div>
       </div>
-    </div>
-  )
-}
 
-function MissingStockCard({ row }: { row: StockMapValue }) {
-  return (
-    <div style={reviewCardStyle}>
-      <div style={reviewTopStyle}>
-        <div>
-          <strong style={skuStyle}>{row.product_sku}</strong>
-          <div style={nameStyle}>{row.product_name}</div>
+      <div style={auditCountGridStyle}>
+        <div style={auditCountCellStyle}>
+          <span style={auditCountLabelStyle}>盤點箱數</span>
+          <strong style={auditCountValueStyle}>{formatNumber(row.count_box)}</strong>
         </div>
-        <span style={{ ...diffPillStyle, color: "#f87171" }}>未盤</span>
-      </div>
-
-      <div style={compareGridStyle}>
-        <div>
-          <span>系統</span>
-          <strong>
-            箱 {formatNumber(row.box)} / 散 {formatNumber(row.piece)}
-          </strong>
-        </div>
-        <div>
-          <span>盤點</span>
-          <strong>箱 0 / 散 0</strong>
-        </div>
-        <div>
-          <span>差異</span>
-          <strong>
-            箱 {formatSigned(0 - row.box)} / 散 {formatSigned(0 - row.piece)}
-          </strong>
+        <div style={auditCountCellStyle}>
+          <span style={auditCountLabelStyle}>盤點散數</span>
+          <strong style={auditCountValueStyle}>{formatNumber(row.count_piece)}</strong>
         </div>
       </div>
     </div>
@@ -1859,11 +1833,6 @@ function formatNumber(value: number) {
     minimumFractionDigits: 0,
     maximumFractionDigits: 2,
   }).format(value)
-}
-
-function formatSigned(value: number) {
-  if (value > 0) return `+${formatNumber(value)}`
-  return formatNumber(value)
 }
 
 function formatDateTime(value: string) {
@@ -2126,10 +2095,8 @@ const missingCostListStyle: CSSProperties = {
 }
 
 const missingCostRowStyle: CSSProperties = {
-  display: "flex",
-  flexWrap: "wrap",
-  justifyContent: "space-between",
-  overflowWrap: "anywhere",
+  display: "grid",
+  gridTemplateColumns: "minmax(0, 1fr) auto",
   alignItems: "center",
   gap: 10,
   border: "1px solid rgba(251,191,36,0.18)",
@@ -2159,6 +2126,7 @@ const sectionTitleRowStyle: CSSProperties = {
 
 const sectionTitleStyle: CSSProperties = {
   margin: 0,
+  color: "#f8fafc",
   fontSize: 17,
   fontWeight: 950,
 }
@@ -2215,8 +2183,11 @@ const auditDeleteButtonStyle: CSSProperties = {
 }
 
 const auditPillsStyle: CSSProperties = {
-  flex: "0 0 auto",
+  flex: "0 1 auto",
+  minWidth: 0,
   display: "flex",
+  flexWrap: "wrap",
+  justifyContent: "flex-end",
   alignItems: "center",
   gap: 6,
 }
@@ -2256,6 +2227,7 @@ const auditHeaderStyle: CSSProperties = {
 
 const auditTitleStyle: CSSProperties = {
   margin: 0,
+  color: "#f8fafc",
   fontSize: 18,
   fontWeight: 950,
 }
@@ -2353,38 +2325,87 @@ const deleteButtonStyle: CSSProperties = {
   fontWeight: 950,
 }
 
-const reviewSummaryStyle: CSSProperties = {
-  display: "grid",
-  gridTemplateColumns: "repeat(3, 1fr)",
-  gap: 10,
-  marginBottom: 14,
-}
-
 const reviewCardStyle: CSSProperties = {
   border: "1px solid rgba(148,163,184,0.16)",
-  borderRadius: 18,
+  borderRadius: 14,
   background: "rgba(2,6,23,0.44)",
-  padding: 14,
-  marginBottom: 12,
+  padding: 10,
+  marginBottom: 8,
 }
 
 const reviewTopStyle: CSSProperties = {
   display: "flex",
   justifyContent: "space-between",
-  gap: 12,
-  marginBottom: 12,
+  alignItems: "flex-start",
+  gap: 10,
+  marginBottom: 8,
 }
 
-const diffPillStyle: CSSProperties = {
+const reviewNameBlockStyle: CSSProperties = {
+  minWidth: 0,
+  flex: "1 1 auto",
+}
+
+const reviewSkuBlockStyle: CSSProperties = {
   flex: "0 0 auto",
-  fontSize: 12,
-  fontWeight: 950,
+  textAlign: "right",
+  maxWidth: "42%",
 }
 
-const compareGridStyle: CSSProperties = {
+const reviewSkuStyle: CSSProperties = {
+  display: "block",
+  color: "#60a5fa",
+  fontSize: 15,
+  fontWeight: 950,
+  marginBottom: 3,
+  overflowWrap: "anywhere",
+}
+
+const reviewNameStyle: CSSProperties = {
+  color: "#f8fafc",
+  fontSize: 14,
+  fontWeight: 900,
+  lineHeight: 1.35,
+  overflowWrap: "anywhere",
+}
+
+const reviewUnitStyle: CSSProperties = {
+  display: "block",
+  color: "#bfdbfe",
+  fontSize: 11,
+  fontWeight: 850,
+  marginTop: 0,
+}
+
+const auditCountGridStyle: CSSProperties = {
   display: "grid",
-  gridTemplateColumns: "repeat(3, 1fr)",
+  gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+  gap: 6,
+}
+
+const auditCountCellStyle: CSSProperties = {
+  border: "1px solid rgba(96,165,250,0.16)",
+  borderRadius: 12,
+  background: "rgba(15,23,42,0.72)",
+  padding: "7px 9px",
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
   gap: 8,
+}
+
+const auditCountLabelStyle: CSSProperties = {
+  display: "block",
+  color: "#94a3b8",
+  fontSize: 11,
+  fontWeight: 850,
+}
+
+const auditCountValueStyle: CSSProperties = {
+  display: "block",
+  color: "#f8fafc",
+  fontSize: 16,
+  fontWeight: 950,
 }
 
 const categoryListStyle: CSSProperties = {
